@@ -32,8 +32,10 @@ router.post("/", (req, res) => {
     timeline: [],
     lives: maxLives,
     maxLives: maxLives,
+    numbersPerPlayer: numbersPerPlayer,
     state: "lobby",
     hostId: "",
+    gameEvents: [],
   };
 
   rooms.set(roomId, room);
