@@ -49,6 +49,7 @@ router.get("/:roomId", (req, res) => {
 
   if (!room) {
     res.status(404).json({ error: "Room not found" });
+    return;
   }
 
   res.json({ room });
