@@ -11,4 +11,5 @@ export interface GameRoom {
   lives: number;
   maxLives: number;
   state: "lobby" | "playing" | "game-over" | "victory";
+  hostId: string;
 }
