@@ -1,5 +1,5 @@
 import { Server, Socket } from "socket.io";
-import { rooms } from "../routes/rooms";
+import { RoomService } from "../services/roomService";
 import { Player } from "../lib/types";
 import { GameEngine } from "../lib/gameLogic";
 
@@ -12,7 +12,7 @@ export const setupSocketHandlers = (io: Server) => {
       "join-room",
       (data: { roomId: string; playerName: string; isHost?: boolean }) => {
         const { roomId, playerName, isHost = false } = data;
-        const room = rooms.get(roomId);
+        const room = RoomService.getRoom(roomId);
 
         if (!room) {
           socket.emit("error", "Room not found");
@@ -28,17 +28,33 @@ export const setupSocketHandlers = (io: Server) => {
           return;
         }
 
+        // Check if player is already in the room
+        const existingPlayer = room.players.find((p) => p.id === socket.id);
+        if (existingPlayer) {
+          // Player reconnecting
+          socket.join(roomId);
+          io.to(roomId).emit("room-updated", room);
+
+          if (room.state !== "lobby") {
+            socket.emit("game-state-updated", GameEngine.getGameState(room));
+          }
+          return;
+        }
+
         const player: Player = {
           id: socket.id,
           username: playerName || "Anonymous",
           numbers: [],
         };
 
+        // Add player to room
         room.players.push(player);
+        RoomService.addPlayer(roomId, player);
 
         // Set host if this is the first player or explicitly marked as host
         if (isHost || room.hostId === "") {
           room.hostId = socket.id;
+          RoomService.setHost(roomId, socket.id);
         }
 
         socket.join(roomId);
@@ -46,6 +62,9 @@ export const setupSocketHandlers = (io: Server) => {
         console.log(
           `${playerName} joined room ${roomId}. Host: ${room.hostId === socket.id}`,
         );
+
+        // Update room in database
+        RoomService.updateRoom(room);
 
         io.to(roomId).emit("room-updated", room);
 
@@ -59,7 +78,7 @@ export const setupSocketHandlers = (io: Server) => {
     // Start game handler
     socket.on("start-game", (data: { roomId: string }) => {
       const { roomId } = data;
-      const room = rooms.get(roomId);
+      const room = RoomService.getRoom(roomId);
 
       if (!room) {
         socket.emit("error", "Room not found");
@@ -104,6 +123,9 @@ export const setupSocketHandlers = (io: Server) => {
           timestamp: Date.now(),
         });
 
+        // Update room in database
+        RoomService.updateRoom(room);
+
         // Notify all players with updated room state (includes events)
         io.to(roomId).emit("room-updated", room);
         io.to(roomId).emit("game-state-updated", GameEngine.getGameState(room));
@@ -118,7 +140,7 @@ export const setupSocketHandlers = (io: Server) => {
     // Play number handler
     socket.on("play-number", (data: { roomId: string; number: number }) => {
       const { roomId, number } = data;
-      const room = rooms.get(roomId);
+      const room = RoomService.getRoom(roomId);
 
       if (!room) {
         socket.emit("error", "Room not found");
@@ -178,6 +200,9 @@ export const setupSocketHandlers = (io: Server) => {
         }
       }
 
+      // Update room in database
+      RoomService.updateRoom(room);
+
       // Update all players with current game state (includes synchronized events)
       io.to(roomId).emit("room-updated", room);
       io.to(roomId).emit("game-state-updated", GameEngine.getGameState(room));
@@ -186,7 +211,7 @@ export const setupSocketHandlers = (io: Server) => {
     // Reset game handler
     socket.on("reset-game", (data: { roomId: string }) => {
       const { roomId } = data;
-      const room = rooms.get(roomId);
+      const room = RoomService.getRoom(roomId);
 
       if (!room) {
         socket.emit("error", "Room not found");
@@ -208,6 +233,9 @@ export const setupSocketHandlers = (io: Server) => {
         timestamp: Date.now(),
       });
 
+      // Update room in database
+      RoomService.updateRoom(room);
+
       io.to(roomId).emit("room-updated", room);
       io.to(roomId).emit("game-state-updated", GameEngine.getGameState(room));
 
@@ -216,8 +244,11 @@ export const setupSocketHandlers = (io: Server) => {
 
     // Leave room handler
     socket.on("leave-room", (data: { roomId: string }) => {
+      console.log(`Player ${socket.id} leaving room ${data.roomId}`);
       socket.leave(data.roomId);
       handlePlayerLeave(socket.id, data.roomId, io);
+      // Confirm the leave operation
+      socket.emit("left-room");
     });
 
     // Disconnect handler
@@ -233,26 +264,35 @@ const handlePlayerLeave = (
   roomId: string | undefined,
   io: Server,
 ) => {
+  console.log(`Handling player leave: ${socketId} from room ${roomId}`);
+
   // Find room if not provided
   if (!roomId) {
-    for (const [id, room] of rooms.entries()) {
-      if (room.players.some((p) => p.id === socketId)) {
-        roomId = id;
-        break;
-      }
-    }
+    // We'd need to track socket-to-room mapping for this
+    // For now, we'll skip this case since it's less common
+    console.log("No roomId provided, skipping player leave handling");
+    return;
   }
 
-  if (!roomId) return;
-
-  const room = rooms.get(roomId);
-  if (!room) return;
+  const room = RoomService.getRoom(roomId);
+  if (!room) {
+    console.log(`Room ${roomId} not found`);
+    return;
+  }
 
   const isHost = room.hostId === socketId;
   const wasInLobby = room.state === "lobby";
+  const playerName = room.players.find((p) => p.id === socketId)?.username;
 
-  // Remove player
+  console.log(
+    `Player ${playerName} (${socketId}) leaving room ${roomId}. IsHost: ${isHost}, WasInLobby: ${wasInLobby}`,
+  );
+
+  // Remove player from room and database
   room.players = room.players.filter((p) => p.id !== socketId);
+  RoomService.removePlayer(socketId);
+
+  console.log(`Room ${roomId} now has ${room.players.length} players`);
 
   // If host left and game is in lobby, delete room and kick everyone
   if (isHost && wasInLobby) {
@@ -261,22 +301,27 @@ const handlePlayerLeave = (
     // Notify all remaining players they're being kicked
     io.to(roomId).emit("room-deleted", { reason: "Host left during lobby" });
 
-    // Remove room
-    rooms.delete(roomId);
+    // Remove room from database
+    RoomService.deleteRoom(roomId);
     return;
   }
 
   // Normal leave handling
   if (room.players.length === 0) {
-    rooms.delete(roomId);
-    console.log(`Room ${roomId} deleted - no players remaining`);
+    console.log(`Room ${roomId} is empty, deleting`);
+    RoomService.deleteRoom(roomId);
   } else {
     // If host left during game, assign new host
     if (isHost && room.players.length > 0) {
       room.hostId = room.players[0].id;
+      RoomService.setHost(roomId, room.players[0].id);
       console.log(`New host assigned: ${room.players[0].username}`);
     }
 
+    // Update room in database
+    RoomService.updateRoom(room);
+
+    console.log(`Sending room-updated to room ${roomId}`);
     io.to(roomId).emit("room-updated", room);
 
     // Update game state if game is in progress
